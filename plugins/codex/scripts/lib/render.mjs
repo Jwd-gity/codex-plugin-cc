@@ -83,8 +83,8 @@ function isStructuredReviewStoredResult(storedJob) {
 
 function formatJobLine(job) {
   const parts = [job.id, `${job.status || "unknown"}`];
-  if (job.kindLabel) {
-    parts.push(job.kindLabel);
+  if (job.displayKind) {
+    parts.push(job.displayKind);
   }
   if (job.title) {
     parts.push(job.title);
@@ -116,7 +116,7 @@ function appendActiveJobsTable(lines, jobs) {
       actions.push(`/codex:cancel ${job.id}`);
     }
     lines.push(
-      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
+      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.displayKind)} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
     );
   }
 }
