@@ -12,11 +12,11 @@ export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
 }
 
-function getCurrentSessionId(options = {}) {
+export function getCurrentSessionId(options = {}) {
   return options.env?.[SESSION_ID_ENV] ?? process.env[SESSION_ID_ENV] ?? null;
 }
 
-function filterJobsForCurrentSession(jobs, options = {}) {
+export function filterJobsForCurrentSession(jobs, options = {}) {
   const sessionId = getCurrentSessionId(options);
   if (!sessionId) {
     return jobs;
@@ -25,9 +25,6 @@ function filterJobsForCurrentSession(jobs, options = {}) {
 }
 
 function getJobTypeLabel(job) {
-  if (typeof job.kindLabel === "string" && job.kindLabel) {
-    return job.kindLabel;
-  }
   if (job.kind === "adversarial-review") {
     return "adversarial-review";
   }
@@ -162,7 +159,7 @@ export function enrichJob(job, options = {}) {
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
   const enriched = {
     ...job,
-    kindLabel: getJobTypeLabel(job),
+    displayKind: getJobTypeLabel(job),
     progressPreview:
       job.status === "queued" || job.status === "running" || job.status === "failed"
         ? readJobProgressPreview(job.logFile, maxProgressLines)

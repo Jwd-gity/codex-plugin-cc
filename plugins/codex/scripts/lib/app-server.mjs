@@ -41,9 +41,7 @@ const DEFAULT_CAPABILITIES = {
   ]
 };
 
-function buildJsonRpcError(code, message, data) {
-  return data === undefined ? { code, message } : { code, message, data };
-}
+import { buildJsonRpcError } from "./json-rpc.mjs";
 
 function createProtocolError(message, data) {
   const error = /** @type {ProtocolError} */ (new Error(message));
