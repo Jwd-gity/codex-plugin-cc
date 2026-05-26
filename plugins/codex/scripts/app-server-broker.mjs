@@ -22,9 +22,7 @@ function buildStreamThreadIds(method, params, result) {
   return threadIds;
 }
 
-function buildJsonRpcError(code, message, data) {
-  return data === undefined ? { code, message } : { code, message, data };
-}
+import { buildJsonRpcError } from "./lib/json-rpc.mjs";
 
 function send(socket, message) {
   if (socket.destroyed) {
