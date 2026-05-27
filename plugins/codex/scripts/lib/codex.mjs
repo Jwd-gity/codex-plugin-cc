@@ -52,7 +52,7 @@ function buildTurnInput(prompt) {
   return [{ type: "text", text: prompt, text_elements: [] }];
 }
 
-import { shorten, looksLikeVerificationCommand } from "./utils.mjs";
+import { looksLikeVerificationCommand } from "./utils.mjs";
 function buildTaskThreadName(prompt) {
   const excerpt = shorten(prompt, 56);
   return excerpt ? `${TASK_THREAD_PREFIX}: ${excerpt}` : TASK_THREAD_PREFIX;

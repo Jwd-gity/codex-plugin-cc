@@ -32,7 +32,7 @@ import {
 import { resolveWorkspaceRoot } from "../workspace.mjs";
 
 const COMMANDS_DIR = path.dirname(fileURLToPath(import.meta.url));
-export const ROOT_DIR = path.resolve(COMMANDS_DIR, "..", "..");
+export const ROOT_DIR = path.resolve(COMMANDS_DIR, "..", "..", "..");
 export const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 
 export const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;

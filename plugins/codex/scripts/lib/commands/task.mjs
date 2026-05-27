@@ -196,7 +196,7 @@ export async function handleTask(argv) {
     return;
   }
 
-  const job = buildTaskJobHelper(workspaceRoot, taskMetadata, write);
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
   await runForegroundCommand(
     job,
     (progress) =>
