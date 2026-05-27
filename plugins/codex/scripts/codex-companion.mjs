@@ -32,6 +32,7 @@ import {
   upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
+import { shorten, nowIso } from "./lib/utils.mjs";
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
@@ -46,7 +47,6 @@ import {
   createJobProgressUpdater,
   createJobRecord,
   createProgressReporter,
-  nowIso,
   runTrackedJob,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
@@ -155,17 +155,6 @@ function resolveCommandWorkspace(options = {}) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function shorten(text, limit = 96) {
-  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
-  if (!normalized) {
-    return "";
-  }
-  if (normalized.length <= limit) {
-    return normalized;
-  }
-  return `${normalized.slice(0, limit - 3)}...`;
 }
 
 function firstMeaningfulLine(text, fallback) {
@@ -546,7 +535,7 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
   const fallbackSummary = resumeLast ? DEFAULT_CONTINUE_PROMPT : "Task";
   return {
     title,
-    summary: shorten(prompt || fallbackSummary)
+    summary: shorten(prompt || fallbackSummary, 96)
   };
 }
 

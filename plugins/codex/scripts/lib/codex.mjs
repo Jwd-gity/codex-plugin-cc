@@ -81,22 +81,7 @@ function buildTurnInput(prompt) {
   return [{ type: "text", text: prompt, text_elements: [] }];
 }
 
-function shorten(text, limit = 72) {
-  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
-  if (!normalized) {
-    return "";
-  }
-  if (normalized.length <= limit) {
-    return normalized;
-  }
-  return `${normalized.slice(0, limit - 3)}...`;
-}
-
-function looksLikeVerificationCommand(command) {
-  return /\b(test|tests|lint|build|typecheck|type-check|check|verify|validate|pytest|jest|vitest|cargo test|npm test|pnpm test|yarn test|go test|mvn test|gradle test|tsc|eslint|ruff)\b/i.test(
-    command
-  );
-}
+import { shorten, looksLikeVerificationCommand } from "./utils.mjs";
 
 function buildTaskThreadName(prompt) {
   const excerpt = shorten(prompt, 56);
