@@ -1,13 +1,12 @@
 import fs from "node:fs";
 import process from "node:process";
 
+import { nowIso } from "./utils.mjs";
 import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
-export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+export { nowIso };
 
-export function nowIso() {
-  return new Date().toISOString();
-}
+export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
 function normalizeProgressEvent(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {

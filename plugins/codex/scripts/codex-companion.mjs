@@ -24,6 +24,7 @@ function printUsage() {
   );
 }
 
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
