@@ -1,4 +1,10 @@
 /**
+ * Codex integration orchestrator.
+ *
+ * Manages the lifecycle of Codex CLI interactions: thread start/resume,
+ * turn capture (notification collection, subagent tracking, progress reporting),
+ * review execution, auth status resolution, and structured output parsing.
+ *
  * @typedef {import("./app-server-protocol").AppServerNotification} AppServerNotification
  * @typedef {import("./app-server-protocol").ReviewTarget} ReviewTarget
  * @typedef {import("./app-server-protocol").ThreadItem} ThreadItem
@@ -534,6 +540,21 @@ function applyTurnNotification(state, message) {
   }
 }
 
+/**
+ * Manages the lifecycle of a single Codex turn.
+ *
+ * Sets up a notification handler that routes messages by lifecycle phase,
+ * tracks subagent threads, extracts reasoning sections, and resolves
+ * the returned promise when the turn completes or times out.
+ *
+ * @param {import("./app-server.mjs").CodexAppServerClient} client
+ * @param {string} threadId
+ * @param {() => Promise<object>} startRequest - Function that initiates the turn
+ * @param {object} [options]
+ * @param {ProgressReporter} [options.onProgress]
+ * @param {(response: object, state: TurnCaptureState) => void} [options.onResponse]
+ * @returns {Promise<TurnCaptureState>}
+ */
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
@@ -1070,3 +1091,6 @@ export function readOutputSchema(schemaPath) {
 }
 
 export { DEFAULT_CONTINUE_PROMPT, TASK_THREAD_PREFIX };
+
+// Internal functions exported for unit testing
+export { extractReasoningSections, mergeReasoningSections, normalizeReasoningText, extractThreadId, extractTurnId };
