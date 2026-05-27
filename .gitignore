@@ -163,6 +163,41 @@ plugins/codex/.generated/
 .local_cache/
 local_cache/
 .vscode/
+.agents/
+
+# AI coding tool configs
+.adal/
+.aider-desk/
+.archon/
+.augment/
+.bob/
+.codeartsdoer/
+.codebuddy/
+.codemaker/
+.codestudio/
+.commandcode/
+.continue/
+.factory/
+.forge/
+.iflow/
+.junie/
+.kilocode/
+.kiro/
+.kode/
+.mcpjam/
+.mux/
+.neovate/
+.openhands/
+.pi/
+.pochi/
+.qoder/
+.qwen/
+.roo/
+.rovodev/
+.tabnine/
+.trae/
+.vibe/
+.zencoder/
 
 # WSL/Windows path artifacts
 D:\\*
@@ -170,3 +205,4 @@ D:\\*
 # Temporary files
 pre-compaction-dialogue.md
 *.tmp
+test-ecc*.js
