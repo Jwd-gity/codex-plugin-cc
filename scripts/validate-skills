@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+
+# validate-skills — check SKILL.md front matter integrity
+# Adapted from steipete/agent-scripts (Ruby) → bash + node for this project.
+#
+# Checks:
+#   - YAML front matter exists (--- delimited)
+#   - 'name' field is non-empty string
+#   - 'description' field is non-empty string
+#   - No duplicate skill names across all roots
+#   - Deduplicates by realpath (handles symlinks)
+#
+# Usage: ./scripts/validate-skills
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+# ── Discover all SKILL.md files (deduplicated by realpath) ──────────
+
+SKILL_DIRS=(
+  "skills"
+  ".claude/skills"
+  "plugins/codex/skills"
+)
+
+declare -A seen_paths
+skill_files=()
+
+for dir in "${SKILL_DIRS[@]}"; do
+  if [[ -d "$dir" ]]; then
+    while IFS= read -r -d '' f; do
+      real="$(realpath "$f" 2>/dev/null || echo "$f")"
+      if [[ -z "${seen_paths[$real]+x}" ]]; then
+        seen_paths["$real"]=1
+        skill_files+=("$f")
+      fi
+    done < <(find "$dir" -name "SKILL.md" -print0 2>/dev/null)
+  fi
+done
+
+if [[ ${#skill_files[@]} -eq 0 ]]; then
+  echo "No SKILL.md files found."
+  exit 0
+fi
+
+# ── Extract front matter fields using Node.js ───────────────────────
+
+errors=()
+declare -A seen_names
+
+for skill_file in "${skill_files[@]}"; do
+  result=$(node -e "
+    const fs = require('fs');
+    const text = fs.readFileSync(process.argv[1], 'utf8');
+    const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|\$)/);
+    if (!m) { console.log(JSON.stringify({error:'missing or malformed front matter'})); process.exit(0); }
+    try {
+      const lines = m[1].split('\n');
+      const data = {};
+      for (const line of lines) {
+        const match = line.match(/^(\w[\w-]*):\s*(.+)/);
+        if (match) data[match[1]] = match[2].replace(/^['\"]|['\"]$/g, '');
+      }
+      const issues = [];
+      if (!data.name || !data.name.trim()) issues.push('missing non-empty string field: name');
+      if (!data.description || !data.description.trim()) issues.push('missing non-empty string field: description');
+      if (issues.length) {
+        console.log(JSON.stringify({error: issues.join('; ')}));
+      } else {
+        console.log(JSON.stringify({name: data.name.trim(), description: data.description.trim()}));
+      }
+    } catch(e) {
+      console.log(JSON.stringify({error: 'parse error: ' + e.message}));
+    }
+  " "$skill_file" 2>/dev/null)
+
+  error=$(echo "$result" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log(d.error||'')" 2>/dev/null)
+  name=$(echo "$result" | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8')); console.log(d.name||'')" 2>/dev/null)
+
+  if [[ -n "$error" ]]; then
+    errors+=("$skill_file: $error")
+    continue
+  fi
+
+  if [[ -n "$name" ]]; then
+    if [[ -n "${seen_names[$name]+x}" ]]; then
+      errors+=("$skill_file: duplicate skill name '$name' (also used by ${seen_names[$name]})")
+    else
+      seen_names["$name"]="$skill_file"
+    fi
+  fi
+done
+
+# ── Report ──────────────────────────────────────────────────────────
+
+if [[ ${#errors[@]} -gt 0 ]]; then
+  echo "Skill validation failed:"
+  for err in "${errors[@]}"; do
+    echo "  - $err"
+  done
+  exit 1
+fi
+
+echo "Validated ${#skill_files[@]} skill(s) across ${#SKILL_DIRS[@]} roots."

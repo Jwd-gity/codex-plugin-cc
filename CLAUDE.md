@@ -78,3 +78,21 @@ On session end (Stop hook), write key decisions to:
 | L3 | memorix | Cross-agent shared memory | `memorix_search` / `memorix_store` |
 | L4 | GitNexus | Code symbol graph | `gitnexus_context` / `gitnexus_impact` |
 | L5 | claude-mem | Persistent observations | `memory_search` / `observation_add` |
+
+## Commit Protocol
+
+Use `./scripts/committer` instead of raw `git commit` for all commits.
+
+```bash
+./scripts/committer "feat: description" file1.js file2.js
+./scripts/committer --force "fix: description" lib/parser.js
+```
+
+**Why:** Prevents `git add .` accidents, blocks sensitive files (.env, *.key), validates conventional commit format, handles stale index.lock.
+
+**Rules:**
+- MUST list specific files (no `.` or `-A`)
+- MUST use conventional commit format: `type: description`
+- Types: feat, fix, refactor, docs, test, chore, perf, ci, style, build, revert
+- Use `--force` when index.lock is stale
+- Use `--no-verify` only for emergencies (skips all safety checks)

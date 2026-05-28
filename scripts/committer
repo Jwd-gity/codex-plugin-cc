@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+
+# committer — safe git commit wrapper for AI agents
+# Adapted from steipete/agent-scripts with project-specific guards.
+#
+# Usage: ./scripts/committer [--force] [--no-verify] "commit message" "file" ["file" ...]
+#
+# Safety features:
+#   - Forbids "git add ." (must list specific files)
+#   - Clears staging area before adding specified files
+#   - Blocks commits of sensitive files (.env, credentials, secrets)
+#   - Validates conventional commit format
+#   - Handles stale index.lock with --force
+#   - Disables glob expansion for bracket-safe paths
+
+set -euo pipefail
+set -f  # disable glob expansion
+
+# ── Config ──────────────────────────────────────────────────────────
+
+# Files that must never be committed
+SENSITIVE_PATTERNS=(
+  '.env'
+  '.env.*'
+  'credentials.json'
+  'credentials.yaml'
+  '*.pem'
+  '*.key'
+  'secrets.*'
+  '.secrets'
+)
+
+# Conventional commit types
+VALID_TYPES=(
+  feat fix refactor docs test chore perf ci
+  style build revert
+)
+
+# ── Helpers ─────────────────────────────────────────────────────────
+
+usage() {
+  cat >&2 <<EOF
+Usage: $(basename "$0") [--force] [--no-verify] "commit message" "file" ["file" ...]
+
+Options:
+  --force       Remove stale index.lock and retry
+  --no-verify   Skip sensitive file and commit format checks
+
+Examples:
+  $(basename "$0") "feat: add user auth" src/auth.js src/auth.test.js
+  $(basename "$0") --force "fix: handle null pointer" lib/parser.js
+EOF
+  exit 2
+}
+
+die() {
+  printf 'Error: %s\n' "$1" >&2
+  exit 1
+}
+
+warn() {
+  printf 'Warning: %s\n' "$1" >&2
+}
+
+# ── Argument Parsing ────────────────────────────────────────────────
+
+force_delete_lock=false
+skip_verify=false
+
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --force)      force_delete_lock=true ;;
+    --no-verify)  skip_verify=true ;;
+    *)            die "unknown option: $1" ;;
+  esac
+  shift
+done
+
+[[ $# -lt 2 ]] && usage
+
+commit_message="$1"
+shift
+[[ $# -lt 1 ]] && usage
+
+files=("$@")
+
+# ── Input Validation ────────────────────────────────────────────────
+
+# Commit message must not be empty
+if [[ "$commit_message" != *[![:space:]]* ]]; then
+  die "commit message must not be empty"
+fi
+
+# First arg must not look like a file path
+if [[ -e "$commit_message" ]]; then
+  die "first argument looks like a file path (\"$commit_message\"); provide the commit message first"
+fi
+
+# Forbid "." — forces explicit file listing
+for file in "${files[@]}"; do
+  if [[ "$file" == "." || "$file" == "./" ]]; then
+    die '". is not allowed — list specific paths instead'
+  fi
+done
+
+# ── Sensitive File Guard ────────────────────────────────────────────
+
+if [[ "$skip_verify" == false ]]; then
+  for file in "${files[@]}"; do
+    basename_file="$(basename "$file")"
+    for pattern in "${SENSITIVE_PATTERNS[@]}"; do
+      # Use bash pattern matching
+      # shellcheck disable=SC2254
+      case "$basename_file" in
+        $pattern)
+          die "refusing to commit sensitive file: $file (matches pattern: $pattern)"
+          ;;
+      esac
+    done
+  done
+fi
+
+# ── Conventional Commit Format Check ────────────────────────────────
+
+if [[ "$skip_verify" == false ]]; then
+  type="${commit_message%%:*}"       # everything before first ':'
+  type="${type%%[[:space:]]*}"       # first word
+  type="$(printf '%s' "$type" | tr '[:upper:]' '[:lower:]')"
+
+  valid_type=false
+  for vt in "${VALID_TYPES[@]}"; do
+    if [[ "$type" == "$vt" ]]; then
+      valid_type=true
+      break
+    fi
+  done
+
+  if [[ "$valid_type" == false ]]; then
+    warn "commit message does not follow conventional format: type: description"
+    warn "valid types: ${VALID_TYPES[*]}"
+    warn "proceeding anyway (use --no-verify to suppress)"
+  fi
+fi
+
+# ── File Existence Check ────────────────────────────────────────────
+
+for file in "${files[@]}"; do
+  if [[ ! -e "$file" ]]; then
+    # Allow staging deletions: file may be in index or HEAD but not on disk
+    if ! git ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
+      if ! git cat-file -e "HEAD:$file" >/dev/null 2>&1; then
+        die "file not found: $file"
+      fi
+    fi
+  fi
+done
+
+# ── Stage & Commit ──────────────────────────────────────────────────
+
+git restore --staged :/
+git add -A -- "${files[@]}"
+
+if git diff --staged --quiet; then
+  warn "no staged changes detected for: ${files[*]}"
+  exit 1
+fi
+
+last_commit_error=''
+
+run_git_commit() {
+  local stderr_log
+  stderr_log=$(mktemp)
+  if git commit -m "$commit_message" -- "${files[@]}" 2> >(tee "$stderr_log" >&2); then
+    rm -f "$stderr_log"
+    last_commit_error=''
+    return 0
+  fi
+  last_commit_error=$(cat "$stderr_log")
+  rm -f "$stderr_log"
+  return 1
+}
+
+committed=false
+if run_git_commit; then
+  committed=true
+elif [[ "$force_delete_lock" == true ]]; then
+  lock_path=$(
+    printf '%s\n' "$last_commit_error" |
+      awk -F"'" '/Unable to create .*\.git\/index\.lock/ { print $2; exit }'
+  )
+
+  if [[ -n "$lock_path" && -e "$lock_path" ]]; then
+    rm -f "$lock_path"
+    warn "removed stale git lock: $lock_path"
+    if run_git_commit; then
+      committed=true
+    fi
+  fi
+fi
+
+if [[ "$committed" == false ]]; then
+  exit 1
+fi
+
+printf 'Committed "%s" with %d file(s)\n' "$commit_message" "${#files[@]}"

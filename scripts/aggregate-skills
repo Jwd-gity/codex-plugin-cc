@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+
+# aggregate-skills — create symlinks in skills/ for all skills from other roots
+# Inspired by steipete/agent-scripts symlink aggregation pattern.
+#
+# Discovers skills in .claude/skills/ and plugins/codex/skills/,
+# then creates relative symlinks in skills/ so a single scan finds everything.
+#
+# Usage: ./scripts/aggregate-skills [--dry-run] [--clean]
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+DRY_RUN=false
+CLEAN=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=true ;;
+    --clean)   CLEAN=true ;;
+    *)         echo "Unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+
+TARGET_DIR="skills"
+
+# Source roots to aggregate (relative to repo root)
+SOURCE_ROOTS=(
+  ".claude/skills"
+  "plugins/codex/skills"
+)
+
+# ── Clean mode: remove managed symlinks ─────────────────────────────
+
+if [[ "$CLEAN" == true ]]; then
+  count=0
+  for link in "$TARGET_DIR"/*/; do
+    link="${link%/}"
+    if [[ -L "$link" ]]; then
+      # Check if it's one of our managed symlinks (pointing outside skills/)
+      target=$(readlink "$link")
+      if [[ "$target" == ../* ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+          echo "[dry-run] would remove: $link -> $target"
+        else
+          rm "$link"
+          echo "removed: $link"
+        fi
+        count=$((count + 1))
+      fi
+    fi
+  done
+  echo "Cleaned $count managed symlink(s)."
+  exit 0
+fi
+
+# ── Aggregate: symlink missing skills into skills/ ──────────────────
+
+created=0
+skipped=0
+conflicts=0
+
+for source_root in "${SOURCE_ROOTS[@]}"; do
+  [[ -d "$source_root" ]] || continue
+
+  for skill_dir in "$source_root"/*/; do
+    [[ -d "$skill_dir" ]] || continue
+
+    skill_name="$(basename "$skill_dir")"
+    target_link="$TARGET_DIR/$skill_name"
+
+    # Skip if already exists (real dir or symlink)
+    if [[ -e "$target_link" || -L "$target_link" ]]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    # Compute relative path from skills/ to source
+    rel_path="../$skill_dir"
+    rel_path="${rel_path%/}"
+
+    if [[ "$DRY_RUN" == true ]]; then
+      echo "[dry-run] would link: $target_link -> $rel_path"
+    else
+      ln -s "$rel_path" "$target_link"
+      echo "linked: $target_link -> $rel_path"
+    fi
+    created=$((created + 1))
+  done
+done
+
+echo ""
+echo "Summary: $created created, $skipped skipped (already exists), $conflicts conflicts"
