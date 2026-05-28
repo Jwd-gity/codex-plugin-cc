@@ -1,0 +1,485 @@
+#!/usr/bin/env node
+
+// skill-audit — ECC skill budget auditor
+// Adapted from steipete/agent-scripts skill-cleaner for Claude Code / ECC.
+//
+// Usage: node scripts/skill-audit [--no-logs] [--months N] [--context-tokens N] [--budget-percent N] [--root PATH] [--all] [--json]
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execSync } from "node:child_process";
+
+// ── Args ────────────────────────────────────────────────────────────
+
+const home = os.homedir();
+const args = new Set(process.argv.slice(2));
+
+function argValue(name, fallback) {
+  const raw = process.argv.slice(2);
+  const index = raw.indexOf(name);
+  return index >= 0 && raw[index + 1] ? raw[index + 1] : fallback;
+}
+
+const months = Number(argValue("--months", "3"));
+const noLogs = args.has("--no-logs");
+const jsonOut = args.has("--json");
+const includeAll = args.has("--all");
+const model = argValue("--model", "claude-sonnet-4-6");
+const budgetPercent = Number(argValue("--budget-percent", "2"));
+const contextTokensOverride = argValue("--context-tokens", "");
+const charsPerToken = Number(argValue("--chars-per-token", "4"));
+const cutoffMs = Date.now() - Math.max(0, months) * 31 * 24 * 60 * 60 * 1000;
+const extraRoots = process.argv
+  .slice(2)
+  .flatMap((arg, index, all) => (arg === "--root" && all[index + 1] ? [all[index + 1]] : []));
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+function expandHome(input) { return input.replace(/^~(?=$|\/)/, home); }
+
+function exists(input) {
+  try { fs.accessSync(input); return true; } catch { return false; }
+}
+
+function formatNumber(n) { return n.toLocaleString("en-US"); }
+function formatPct(n) { return `${(n * 100).toFixed(1)}%`; }
+function formatOnePct(n) { return `${(n * 100).toFixed(2)}%`; }
+
+function groupBy(items, fn) {
+  const map = new Map();
+  for (const item of items) {
+    const key = fn(item);
+    const list = map.get(key) ?? [];
+    list.push(item);
+    map.set(key, list);
+  }
+  return map;
+}
+
+// ── File walking ────────────────────────────────────────────────────
+
+function walkFiles(root, predicate, maxDepth = 8) {
+  const out = [];
+  const seen = new Set();
+  function walk(dir, depth) {
+    if (depth > maxDepth) return;
+    let real;
+    try { real = fs.realpathSync(dir); } catch { return; }
+    if (seen.has(real)) return;
+    seen.add(real);
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (entry.name === "node_modules" || entry.name === ".git") continue;
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory() || entry.isSymbolicLink()) {
+        let stat;
+        try { stat = fs.statSync(file); } catch { continue; }
+        if (stat.isDirectory()) walk(file, depth + 1);
+      } else if (entry.isFile() && predicate(file)) {
+        out.push(file);
+      }
+    }
+  }
+  if (exists(root)) walk(root, 0);
+  return out;
+}
+
+// ── YAML frontmatter parsing ────────────────────────────────────────
+
+function sanitizeSingleLine(value) {
+  return value.replace(/[\r\n\t]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function parseYamlScalar(raw) {
+  const value = raw.trim();
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
+function parseFrontmatter(file) {
+  const text = fs.readFileSync(file, "utf8");
+  const lines = text.split(/\r?\n/);
+  if (lines[0]?.trim() !== "---") return null;
+  const fm = [];
+  let end = -1;
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i]?.trim() === "---") { end = i; break; }
+    fm.push(lines[i] ?? "");
+  }
+  if (end < 0) return null;
+  let name, description;
+  for (let i = 0; i < fm.length; i++) {
+    const line = fm[i] ?? "";
+    const match = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
+    if (!match) continue;
+    const key = match[1];
+    const raw = match[2] ?? "";
+    if (key === "name") name = sanitizeSingleLine(parseYamlScalar(raw));
+    if (key === "description") {
+      if (raw.trim() === "|" || raw.trim() === ">") {
+        const block = [];
+        for (let j = i + 1; j < fm.length; j++) {
+          if (/^[A-Za-z0-9_-]+:\s*/.test(fm[j] ?? "")) break;
+          block.push((fm[j] ?? "").replace(/^\s{2}/, ""));
+        }
+        description = sanitizeSingleLine(block.join(" "));
+      } else {
+        description = sanitizeSingleLine(parseYamlScalar(raw));
+      }
+    }
+  }
+  return { name, description, body: lines.slice(end + 1).join("\n") };
+}
+
+// ── Hashing & similarity ────────────────────────────────────────────
+
+function fnv1a(input) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) { hash ^= input.charCodeAt(i); hash = Math.imul(hash, 0x01000193); }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function normalizeWords(input) {
+  return input.toLowerCase().replace(/[`"''().,;:!?/\\[\]{}_-]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function wordSet(input) { return new Set(normalizeWords(input).split(" ").filter((w) => w.length >= 2)); }
+
+function jaccard(a, b) {
+  if (a.size === 0 && b.size === 0) return 1;
+  let intersection = 0;
+  for (const item of a) { if (b.has(item)) intersection++; }
+  return intersection / (a.size + b.size - intersection);
+}
+
+function similarity(a, b) {
+  return { body: jaccard(wordSet(a.bodyKey), wordSet(b.bodyKey)), description: jaccard(wordSet(a.descKey), wordSet(b.descKey)) };
+}
+
+function isLikelyCopy(score) { return score.body >= 0.85 || (score.body >= 0.6 && score.description >= 0.8); }
+
+// ── ECC-specific scope & priority ───────────────────────────────────
+
+function skillRootScope(root) {
+  const normalized = root.split(path.sep).join("/");
+  if (normalized.includes("/.claude/skills")) return "user-skills";
+  if (normalized.includes("/.agents/skills")) return "agents";
+  if (normalized.includes("/skills/") && !normalized.includes("/.claude/")) return "project";
+  if (normalized.includes("/plugins/codex/skills")) return "plugin";
+  if (normalized.includes("/.claude/plugins/")) return "claude-plugin";
+  return "extra";
+}
+
+function deletePriority(skill) {
+  const p = { extra: 6, "claude-plugin": 5, plugin: 4, agents: 3, project: 2, "user-skills": 1 };
+  return p[skill.scope] ?? 0;
+}
+
+function preferredKeepSkill(list) {
+  return [...list].sort((a, b) => {
+    const byP = deletePriority(a) - deletePriority(b);
+    if (byP !== 0) return byP;
+    return a.realPath.length - b.realPath.length || a.realPath.localeCompare(b.realPath);
+  })[0];
+}
+
+function preferredDisplaySkill(a, b) {
+  if (a.path === a.realPath && b.path !== b.realPath) return a;
+  if (b.path === b.realPath && a.path !== a.realPath) return b;
+  return a.path.length <= b.path.length ? a : b;
+}
+
+// ── ECC discovery roots ─────────────────────────────────────────────
+
+function discoverRoots() {
+  const rootsByRealPath = new Map();
+  let projectRoot = process.cwd();
+  try { projectRoot = execSync("git rev-parse --show-toplevel", { encoding: "utf8" }).trim(); } catch {}
+
+  [
+    path.join(home, ".claude/skills"),
+    path.join(projectRoot, "skills"),
+    path.join(projectRoot, ".claude/skills"),
+    path.join(projectRoot, "plugins/codex/skills"),
+    ...extraRoots.map(expandHome),
+  ].forEach((root) => {
+    if (!exists(root)) return;
+    const real = fs.realpathSync(root);
+    const current = rootsByRealPath.get(real);
+    if (!current || root.length < current.length) rootsByRealPath.set(real, root);
+  });
+
+  // Scan ~/.claude/plugins/ for skill directories
+  const pluginsDir = path.join(home, ".claude/plugins");
+  if (exists(pluginsDir)) {
+    for (const entry of fs.readdirSync(pluginsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const skillRoot = path.join(pluginsDir, entry.name, "skills");
+      if (exists(skillRoot)) {
+        const real = fs.realpathSync(skillRoot);
+        const current = rootsByRealPath.get(real);
+        if (!current || skillRoot.length < current.length) rootsByRealPath.set(real, skillRoot);
+      }
+    }
+  }
+
+  return [...rootsByRealPath.values()].sort();
+}
+
+// ── Skill discovery ─────────────────────────────────────────────────
+
+function discoverSkills() {
+  const skillsByRealPath = new Map();
+  for (const root of discoverRoots()) {
+    for (const file of walkFiles(root, (c) => path.basename(c) === "SKILL.md", 10)) {
+      const parsed = parseFrontmatter(file);
+      if (!parsed) continue;
+      const baseName = parsed.name || path.basename(path.dirname(file));
+      const name = baseName;
+      const description = parsed.description ?? "";
+      const rendered = description ? `- ${name}: ${description} (file: ${file})` : `- ${name}: (file: ${file})`;
+      const bodyKey = normalizeWords(parsed.body);
+      const skill = {
+        name, baseName, description, path: file,
+        realPath: fs.realpathSync(file),
+        dir: path.dirname(file), root,
+        realRoot: fs.realpathSync(root),
+        scope: skillRootScope(root),
+        enabled: true,
+        descChars: [...description].length,
+        lineChars: [...`${rendered}\n`].length,
+        lineBytes: Buffer.byteLength(`${rendered}\n`, "utf8"),
+        bodyHash: fnv1a(bodyKey), bodyKey,
+        descKey: normalizeWords(description),
+      };
+      const existing = skillsByRealPath.get(skill.realPath);
+      skillsByRealPath.set(skill.realPath, existing ? preferredDisplaySkill(existing, skill) : skill);
+    }
+  }
+  return [...skillsByRealPath.values()];
+}
+
+// ── Log scanning (Claude Code transcripts) ──────────────────────────
+
+function recentLogFiles() {
+  if (noLogs) return [];
+  const files = new Set();
+  const roots = [path.join(home, ".claude/projects")];
+  for (const root of roots) {
+    for (const file of walkFiles(root, (c) => c.endsWith(".jsonl") || c.endsWith(".json"), 10)) {
+      try { if (fs.statSync(file).mtimeMs >= cutoffMs) files.add(file); } catch {}
+    }
+  }
+  return [...files].sort();
+}
+
+function scanUsage(skills, logFiles) {
+  const usage = new Map();
+  for (const skill of skills) usage.set(skill.name, { dollar: 0, fileRead: 0, text: 0 });
+  const skillNames = new Set(skills.map((s) => s.name));
+  for (const logFile of logFiles) {
+    try {
+      const text = fs.readFileSync(logFile, "utf8");
+      for (const name of skillNames) {
+        const item = usage.get(name);
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const dollarMatches = text.match(new RegExp(`\\$${escaped}\\b`, "gi"));
+        if (dollarMatches) item.dollar += dollarMatches.length;
+        const skill = skills.find((s) => s.name === name);
+        const pathEscaped = skill.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const fileMatches = text.match(new RegExp(pathEscaped, "g"));
+        if (fileMatches) item.fileRead += fileMatches.length;
+        if (name.length >= 4) {
+          const textMatches = text.match(new RegExp(`\\b${escaped}\\b`, "gi"));
+          if (textMatches) item.text += textMatches.length - (dollarMatches?.length ?? 0) - (fileMatches?.length ?? 0);
+        }
+      }
+    } catch {}
+  }
+  return usage;
+}
+
+// ── Budget calculation ──────────────────────────────────────────────
+
+function eccContext(modelName) {
+  const override = Number(contextTokensOverride);
+  if (Number.isFinite(override) && override > 0) return { tokens: override, source: "--context-tokens" };
+
+  const modelContexts = {
+    "claude-opus-4-8": 200_000, "claude-opus-4-7": 200_000, "claude-opus-4-6": 200_000,
+    "claude-sonnet-4-6": 200_000, "claude-sonnet-4-5": 200_000, "claude-haiku-4-5": 200_000,
+    "claude-sonnet-4-6[1m]": 1_000_000,
+  };
+
+  for (const [key, tokens] of Object.entries(modelContexts)) {
+    const base = key.replace("[1m]", "");
+    if (modelName.toLowerCase().includes(base)) {
+      if (modelName.includes("[1m]") && key.includes("[1m]")) return { tokens, source: `model:${key}` };
+      if (!key.includes("[1m]")) return { tokens, source: `model:${key}` };
+    }
+  }
+  return { tokens: 200_000, source: "fallback:claude-sonnet-4-6" };
+}
+
+function skillBudget(skills) {
+  const { tokens: contextTokens, source: contextSource } = eccContext(model);
+  const budgetTokens = Math.floor(contextTokens * (budgetPercent / 100));
+  const sorted = [...skills].sort((a, b) => a.lineChars - b.lineChars);
+  let used = 0, included = 0, truncatedDescChars = 0, truncatedCount = 0;
+  for (const skill of sorted) {
+    if (used + skill.lineChars <= budgetTokens) { used += skill.lineChars; included++; }
+    else { truncatedDescChars += skill.descChars; truncatedCount++; }
+  }
+  const totalBytes = skills.reduce((sum, s) => sum + s.lineBytes, 0);
+  const minimumBytes = skills.reduce((sum, s) => sum + Buffer.byteLength(`- ${s.name}\n`, "utf8"), 0);
+  return {
+    model, contextTokens, contextSource, budgetPercent, budgetTokens,
+    renderedLineChars: skills.reduce((sum, s) => sum + s.lineChars, 0),
+    unbudgetedFullTokens: Math.ceil(totalBytes / charsPerToken),
+    minimumTokens: Math.ceil(minimumBytes / charsPerToken),
+    budgetedTokens: Math.ceil(used / charsPerToken),
+    charsPerToken,
+    unbudgetedBudgetUsedRatio: Math.ceil(totalBytes / charsPerToken) / budgetTokens,
+    budgetedBudgetUsedRatio: Math.ceil(used / charsPerToken) / budgetTokens,
+    unbudgetedContextUsedRatio: Math.ceil(totalBytes / charsPerToken) / contextTokens,
+    budgetedContextUsedRatio: Math.ceil(used / charsPerToken) / contextTokens,
+    remainingBudgetTokens: budgetTokens - Math.ceil(used / charsPerToken),
+    includedSkills: included, omittedSkills: skills.length - included,
+    truncatedDescriptionChars: truncatedDescChars, truncatedDescriptionCount: truncatedCount,
+  };
+}
+
+// ── Description suggestions ─────────────────────────────────────────
+
+function suggestDescription(skill) {
+  const words = skill.description.split(/\s+/);
+  return words.length <= 12 ? skill.description : words.slice(0, 12).join(" ") + "...";
+}
+
+// ── Duplicate suggestions ───────────────────────────────────────────
+
+function duplicateDeleteSuggestions(groups) {
+  const lines = [];
+  for (const [name, list] of groups.slice(0, 80)) {
+    const keep = preferredKeepSkill(list);
+    const candidates = list
+      .filter((s) => s.realPath !== keep.realPath)
+      .map((s) => ({ skill: s, score: similarity(keep, s) }))
+      .filter(({ score }) => isLikelyCopy(score))
+      .sort((a, b) => b.score.body - a.score.body || b.score.description - a.score.description);
+    if (candidates.length === 0) continue;
+    lines.push(`- ${name}`);
+    lines.push(`  keep: ${keep.scope}: ${keep.path}`);
+    for (const { skill, score } of candidates) {
+      lines.push(`  delete: ${skill.scope}: ${skill.path} (similarity body=${formatPct(score.body)}, description=${formatPct(score.description)})`);
+    }
+  }
+  return lines.length ? lines : ["- none"];
+}
+
+// ── Render report ───────────────────────────────────────────────────
+
+function render(skills, usage, logFiles) {
+  const enabled = skills.filter((s) => s.enabled || includeAll);
+  const roots = groupBy(skills, (s) => s.root);
+  const byBase = [...groupBy(enabled, (s) => s.baseName.toLowerCase()).entries()].filter(([, list]) => list.length > 1);
+  const byBody = [...groupBy(enabled, (s) => s.bodyHash).entries()].filter(([hash, list]) => hash !== "811c9dc5" && list.length > 1);
+  const longDescriptions = enabled.filter((s) => s.descChars >= 110 || s.lineChars >= 180).sort((a, b) => b.descChars - a.descChars).slice(0, 30);
+  const unused = enabled
+    .filter((s) => { const u = usage.get(s.name); return !u || u.dollar + u.fileRead + u.text === 0; })
+    .sort((a, b) => a.scope.localeCompare(b.scope) || a.name.localeCompare(b.name)).slice(0, 80);
+  const totalLineChars = enabled.reduce((sum, s) => sum + s.lineChars, 0);
+  const totalDescChars = enabled.reduce((sum, s) => sum + s.descChars, 0);
+  const budget = skillBudget(enabled);
+
+  const lines = [];
+  lines.push("# Skill Audit Report (ECC)", "");
+  lines.push(`generated: ${new Date().toISOString()}`);
+  lines.push(`months: ${months}`);
+  lines.push(`skills: ${skills.length} discovered, ${enabled.length} considered`);
+  lines.push(`description_chars: ${totalDescChars}`);
+  lines.push(`rendered_line_chars: ${totalLineChars}`);
+  lines.push(`log_files_scanned: ${logFiles.length}`, "");
+
+  lines.push("## Skill Budget", "");
+  lines.push(`model: ${budget.model}`);
+  lines.push(`context_tokens: ${formatNumber(budget.contextTokens)}`);
+  lines.push(`context_source: ${budget.contextSource}`);
+  lines.push(`${budget.budgetPercent}%_budget_tokens: ${formatNumber(budget.budgetTokens)}`);
+  lines.push(`cost_rule: ceil(utf8_bytes / ${budget.charsPerToken})`);
+  lines.push(`unbudgeted_full_tokens: ${formatNumber(budget.unbudgetedFullTokens)}`);
+  lines.push(`minimum_no_description_tokens: ${formatNumber(budget.minimumTokens)}`);
+  lines.push(`budgeted_tokens_used: ${formatNumber(budget.budgetedTokens)}`);
+  lines.push(`used_of_2%_budget: ${formatOnePct(budget.budgetedBudgetUsedRatio)}`);
+  lines.push(`unbudgeted_used_of_2%_budget: ${formatOnePct(budget.unbudgetedBudgetUsedRatio)}`);
+  lines.push(`used_of_context: ${formatOnePct(budget.budgetedContextUsedRatio)}`);
+  lines.push(`remaining_2%_budget_tokens: ${formatNumber(budget.remainingBudgetTokens)}`);
+  lines.push(`included_skills_after_budget: ${budget.includedSkills}`);
+  lines.push(`omitted_skills_after_budget: ${budget.omittedSkills}`);
+  lines.push(`truncated_description_chars: ${formatNumber(budget.truncatedDescriptionChars)}`, "");
+
+  lines.push("## Description Candidates", "");
+  for (const skill of longDescriptions) {
+    lines.push(`- ${skill.name}`, `  path: ${skill.path}`, `  chars: description=${skill.descChars}, rendered_line=${skill.lineChars}`);
+    lines.push(`  current: ${skill.description}`, `  suggested: ${suggestDescription(skill)}`);
+  }
+  if (longDescriptions.length === 0) lines.push("- none");
+  lines.push("");
+
+  lines.push("## Duplicates By Name", "");
+  for (const [name, list] of byBase.slice(0, 40)) {
+    lines.push(`- ${name}`);
+    const keep = preferredKeepSkill(list);
+    lines.push(`  keep-default: ${keep.scope}: ${keep.path}`);
+    for (const skill of list) {
+      const score = skill.realPath === keep.realPath ? { body: 1, description: 1 } : similarity(keep, skill);
+      lines.push(`  - ${skill.scope}: ${skill.path} (body=${formatPct(score.body)}, description=${formatPct(score.description)})`);
+    }
+  }
+  if (byBase.length === 0) lines.push("- none");
+  lines.push("");
+
+  lines.push("## Duplicate Delete Suggestions", "");
+  lines.push(...duplicateDeleteSuggestions(byBase));
+  lines.push("");
+
+  lines.push("## Duplicates By Body Hash", "");
+  for (const [, list] of byBody.slice(0, 30)) {
+    lines.push(`- ${list.map((s) => s.name).join(", ")}`);
+    for (const skill of list) lines.push(`  - ${skill.scope}: ${skill.path}`);
+  }
+  if (byBody.length === 0) lines.push("- none");
+  lines.push("");
+
+  lines.push("## Unused Candidates", "");
+  for (const skill of unused) {
+    const item = usage.get(skill.name) ?? { dollar: 0, fileRead: 0, text: 0 };
+    lines.push(`- ${skill.name}: ${skill.scope}; usage=$${item.dollar}, reads=${item.fileRead}, text=${item.text}; ${skill.path}`);
+  }
+  if (unused.length === 0) lines.push("- none");
+  lines.push("");
+
+  lines.push("## Root Summary", "");
+  for (const [root, list] of roots) {
+    const enabledCount = list.filter((s) => s.enabled).length;
+    lines.push(`- ${root} (${enabledCount}/${list.length} enabled, scope=${skillRootScope(root)})`);
+  }
+
+  return lines.join("\n");
+}
+
+// ── Main ────────────────────────────────────────────────────────────
+
+const skills = discoverSkills();
+const logFiles = recentLogFiles();
+const usage = scanUsage(skills, logFiles);
+
+if (jsonOut) {
+  console.log(JSON.stringify({ skills, usage: Object.fromEntries(usage), logFiles }, null, 2));
+} else {
+  console.log(render(skills, usage, logFiles));
+}
